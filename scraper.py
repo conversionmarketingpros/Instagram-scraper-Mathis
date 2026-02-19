@@ -1,133 +1,212 @@
-import instaloader
 import os
 import requests
+import json
 from datetime import datetime
 from supabase import create_client, Client
 import time
+import re
 
 # Initialize Supabase
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Initialize Instaloader with conservative settings
-L = instaloader.Instaloader(
-    download_pictures=True,
-    download_videos=True,
-    download_video_thumbnails=False,
-    compress_json=False,
-    save_metadata=False,
-    post_metadata_txt_pattern="",
-    max_connection_attempts=3,
-    request_timeout=300
-)
-
-# ⚠️ CONFIGURATION - CHANGE THIS FOR YOUR NEW CLIENT
+# ⚠️ CONFIGURATION - CHANGE THIS FOR YOUR CLIENT
 INSTAGRAM_USERNAME = "realestateduo.pnw"  # ← CHANGE THIS!
 TABLE_NAME = "instagram_posts"
 STORAGE_BUCKET = "instagram-images"
 
-def get_latest_post_from_db():
-    """Get the most recent post date from database"""
+def get_instagram_posts_json(username):
+    """Fetch Instagram posts using public JSON endpoint"""
+    
+    # Method 1: Try direct JSON API
+    url = f"https://www.instagram.com/{username}/?__a=1&__d=dis"
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Cache-Control': 'max-age=0'
+    }
+    
     try:
-        response = supabase.table(TABLE_NAME)\
-            .select('posted_at')\
-            .order('posted_at', desc=True)\
-            .limit(1)\
-            .execute()
+        print(f"Fetching Instagram data for @{username}...")
+        response = requests.get(url, headers=headers, timeout=15)
         
-        if response.data and len(response.data) > 0:
-            return datetime.fromisoformat(response.data[0]['posted_at'].replace('Z', '+00:00'))
-        return None
+        if response.status_code == 200:
+            # Try to parse as JSON first
+            try:
+                data = response.json()
+                print("✓ Got JSON response directly")
+                return data
+            except:
+                # If not JSON, try to extract from HTML
+                html = response.text
+                
+                # Look for embedded JSON in script tags
+                patterns = [
+                    r'window\._sharedData\s*=\s*({.+?});</script>',
+                    r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);</script>',
+                ]
+                
+                for pattern in patterns:
+                    match = re.search(pattern, html)
+                    if match:
+                        try:
+                            data = json.loads(match.group(1))
+                            print("✓ Extracted JSON from HTML")
+                            return data
+                        except:
+                            continue
+                
+                print("⚠️ Could not parse JSON from response")
+                return None
+        else:
+            print(f"❌ HTTP {response.status_code}")
+            return None
+            
     except Exception as e:
-        print(f"Error getting latest post: {e}")
+        print(f"❌ Error fetching data: {e}")
         return None
 
-def download_latest_posts(username, limit=12):
-    """Download only the latest posts from Instagram with LONG delays"""
-    print(f"Fetching latest posts from @{username}...")
-    print("⚠️ Using SLOW mode with long delays to avoid rate limits")
-    
-    latest_db_date = get_latest_post_from_db()
-    if latest_db_date:
-        print(f"Latest post in database: {latest_db_date}")
-    else:
-        print("No posts in database yet, fetching recent posts...")
-    
+def parse_instagram_data(data):
+    """Parse Instagram JSON to extract posts"""
     try:
-        # LONG initial delay before starting
-        print("⏳ Waiting 10 seconds before fetching profile...")
-        time.sleep(10)
+        user_data = None
         
-        profile = instaloader.Profile.from_username(L.context, username)
-        posts = []
+        # Try multiple JSON structures (Instagram changes these often)
+        possible_paths = [
+            # Structure 1: Direct graphql
+            lambda d: d.get('graphql', {}).get('user'),
+            # Structure 2: data.user
+            lambda d: d.get('data', {}).get('user'),
+            # Structure 3: entry_data
+            lambda d: d.get('entry_data', {}).get('ProfilePage', [{}])[0].get('graphql', {}).get('user'),
+            # Structure 4: items (newer API)
+            lambda d: d.get('items', [{}])[0] if 'items' in d else None
+        ]
         
-        print(f"✓ Profile loaded. Starting to fetch posts slowly...")
-        
-        post_count = 0
-        for post in profile.get_posts():
-            # If we already have this post or older, stop
-            if latest_db_date and post.date_utc <= latest_db_date:
-                print(f"Reached existing posts (post from {post.date_utc}), stopping...")
-                break
-            
-            if len(posts) >= limit:
-                break
-            
-            # Get the post URL
-            post_url = f"https://www.instagram.com/p/{post.shortcode}/"
-            
-            post_data = {
-                'shortcode': post.shortcode,
-                'post_url': post_url,
-                'caption': post.caption if post.caption else "",
-                'likes': post.likes,
-                'date': post.date_utc.isoformat(),
-                'is_video': post.is_video
-            }
-            
-            posts.append(post_data)
-            post_count += 1
-            
-            # Download the media (image or video)
-            print(f"\n[{post_count}/{limit}] Downloading {'video' if post.is_video else 'image'}: {post.shortcode}")
-            
-            # LONG delay before downloading (15 seconds)
-            print("⏳ Waiting 15 seconds before download...")
-            time.sleep(15)
-            
+        for path_func in possible_paths:
             try:
-                L.download_post(post, target=f"temp_{post.shortcode}")
-                print(f"✓ Downloaded successfully")
-            except Exception as e:
-                print(f"⚠️ Error downloading {post.shortcode}: {e}")
-                # If download fails, wait even longer before continuing
-                print("⏳ Error occurred, waiting extra 20 seconds...")
-                time.sleep(20)
+                user_data = path_func(data)
+                if user_data:
+                    break
+            except:
+                continue
+        
+        if not user_data:
+            print("❌ Could not find user data in response")
+            print("Response keys:", list(data.keys())[:5] if isinstance(data, dict) else "Not a dict")
+            return []
+        
+        # Extract posts/edges
+        edges = []
+        if 'edge_owner_to_timeline_media' in user_data:
+            edges = user_data['edge_owner_to_timeline_media'].get('edges', [])
+        elif 'edge_felix_video_timeline' in user_data:
+            edges = user_data['edge_felix_video_timeline'].get('edges', [])
+        elif 'media' in user_data:
+            # Convert media items to edge format
+            edges = [{'node': item} for item in user_data['media'].get('nodes', [])]
+        
+        if not edges:
+            print("❌ No posts found")
+            return []
+        
+        posts = []
+        print(f"Found {len(edges)} posts, processing latest 12...")
+        
+        for edge in edges[:12]:
+            node = edge.get('node', {})
+            
+            shortcode = node.get('shortcode')
+            if not shortcode:
                 continue
             
-            # EXTRA LONG delay every 2 posts (60 seconds!)
-            if post_count % 2 == 0:
-                print(f"⏳ Downloaded {post_count} posts. Taking a 60-second break to avoid rate limits...")
-                time.sleep(60)
+            # Get media URL
+            display_url = node.get('display_url') or node.get('thumbnail_src')
+            is_video = node.get('is_video', False)
+            
+            if is_video:
+                media_url = node.get('video_url', display_url)
             else:
-                # Regular delay between posts (20 seconds)
-                print("⏳ Waiting 20 seconds before next post...")
-                time.sleep(20)
+                media_url = display_url
+            
+            if not media_url:
+                print(f"⚠️ No media URL for {shortcode}, skipping")
+                continue
+            
+            # Get caption
+            caption = ""
+            caption_edges = node.get('edge_media_to_caption', {}).get('edges', [])
+            if caption_edges:
+                caption = caption_edges[0].get('node', {}).get('text', '')
+            elif 'caption' in node:
+                caption = node.get('caption', '')
+            
+            # Limit caption length
+            if caption:
+                caption = caption[:500]
+            
+            # Get likes
+            likes = 0
+            if 'edge_liked_by' in node:
+                likes = node['edge_liked_by'].get('count', 0)
+            elif 'edge_media_preview_like' in node:
+                likes = node['edge_media_preview_like'].get('count', 0)
+            elif 'like_count' in node:
+                likes = node.get('like_count', 0)
+            
+            # Get timestamp
+            timestamp = node.get('taken_at_timestamp') or node.get('taken_at')
+            if timestamp:
+                posted_at = datetime.fromtimestamp(timestamp).isoformat()
+            else:
+                posted_at = datetime.utcnow().isoformat()
+            
+            posts.append({
+                'shortcode': shortcode,
+                'post_url': f"https://www.instagram.com/p/{shortcode}/",
+                'media_url': media_url,
+                'caption': caption,
+                'likes': likes,
+                'is_video': is_video,
+                'posted_at': posted_at
+            })
         
-        print(f"\n✓ Found {len(posts)} new posts")
+        print(f"✓ Successfully parsed {len(posts)} posts")
         return posts
     
-    except instaloader.exceptions.ConnectionException as e:
-        print(f"❌ Connection error (possible rate limit): {e}")
-        print("💡 Try again in 1-2 hours. Instagram has temporarily blocked requests.")
-        return []
-    except instaloader.exceptions.QueryReturnedNotFoundException:
-        print(f"❌ User @{username} not found or account is private")
-        return []
     except Exception as e:
-        print(f"❌ Error fetching posts: {e}")
+        print(f"❌ Error parsing data: {e}")
+        import traceback
+        traceback.print_exc()
         return []
+
+def download_media(url, filename):
+    """Download media file from URL"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            with open(filename, 'wb') as f:
+                f.write(response.content)
+            return True
+        else:
+            print(f"❌ Download failed: HTTP {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"❌ Download error: {e}")
+        return False
 
 def upload_to_supabase_storage(local_path, remote_path):
     """Upload media file to Supabase Storage"""
@@ -138,7 +217,7 @@ def upload_to_supabase_storage(local_path, remote_path):
         # Determine content type
         content_type = "video/mp4" if local_path.endswith('.mp4') else "image/jpeg"
         
-        response = supabase.storage.from_(STORAGE_BUCKET).upload(
+        supabase.storage.from_(STORAGE_BUCKET).upload(
             remote_path,
             file_data,
             file_options={"content-type": content_type, "upsert": "true"}
@@ -149,11 +228,11 @@ def upload_to_supabase_storage(local_path, remote_path):
         return public_url
     
     except Exception as e:
-        print(f"Error uploading to Supabase: {e}")
+        print(f"❌ Upload error: {e}")
         return None
 
 def save_to_database(post_data, media_url):
-    """Save post metadata to Supabase database"""
+    """Save post to database"""
     try:
         data = {
             'shortcode': post_data['shortcode'],
@@ -162,20 +241,30 @@ def save_to_database(post_data, media_url):
             'caption': post_data['caption'],
             'likes': post_data['likes'],
             'is_video': post_data['is_video'],
-            'posted_at': post_data['date'],
+            'posted_at': post_data['posted_at'],
             'scraped_at': datetime.utcnow().isoformat()
         }
         
-        # Insert (will fail if duplicate due to unique constraint)
-        response = supabase.table(TABLE_NAME).insert(data).execute()
-        return response
-    
+        # Try insert
+        supabase.table(TABLE_NAME).insert(data).execute()
+        return True
+        
     except Exception as e:
-        print(f"Error saving to database: {e}")
-        return None
+        # If duplicate, try update
+        try:
+            supabase.table(TABLE_NAME).update({
+                'likes': post_data['likes'],
+                'caption': post_data['caption'],
+                'image_url': media_url,
+                'scraped_at': datetime.utcnow().isoformat()
+            }).eq('shortcode', post_data['shortcode']).execute()
+            return True
+        except Exception as e2:
+            print(f"❌ Save error: {e2}")
+            return False
 
 def check_if_exists(shortcode):
-    """Check if post already exists in database"""
+    """Check if post exists in database"""
     try:
         response = supabase.table(TABLE_NAME)\
             .select('shortcode')\
@@ -185,35 +274,9 @@ def check_if_exists(shortcode):
     except:
         return False
 
-def cleanup_temp_files(shortcode):
-    """Clean up temporary downloaded files"""
-    import glob
-    import shutil
-    
-    temp_folder = f"temp_{shortcode}"
-    if os.path.exists(temp_folder):
-        shutil.rmtree(temp_folder)
-
-def find_media_file(temp_folder):
-    """Find the main media file in temp folder"""
-    if not os.path.exists(temp_folder):
-        return None
-    
-    # Look for mp4 (video) or jpg (image)
-    files = os.listdir(temp_folder)
-    
-    # Priority: mp4 > jpg
-    for ext in ['.mp4', '.jpg', '.jpeg']:
-        for f in files:
-            if f.endswith(ext) and not f.endswith('_1.jpg'):  # Skip carousel extras
-                return os.path.join(temp_folder, f)
-    
-    return None
-
 def delete_old_posts(keep_count=12):
     """Delete posts beyond the latest keep_count"""
     try:
-        # Get all posts ordered by date
         response = supabase.table(TABLE_NAME)\
             .select('id, shortcode, image_url')\
             .order('posted_at', desc=True)\
@@ -222,14 +285,11 @@ def delete_old_posts(keep_count=12):
         all_posts = response.data
         
         if len(all_posts) <= keep_count:
-            print(f"✓ Database has {len(all_posts)} posts (within limit of {keep_count})")
+            print(f"✓ Database has {len(all_posts)} posts (within limit)")
             return
         
-        # Posts to delete (everything after position keep_count)
         posts_to_delete = all_posts[keep_count:]
-        
-        print(f"\nCleaning up old posts...")
-        print(f"Deleting {len(posts_to_delete)} old posts...")
+        print(f"\nCleaning up {len(posts_to_delete)} old posts...")
         
         for post in posts_to_delete:
             # Delete from database
@@ -237,113 +297,103 @@ def delete_old_posts(keep_count=12):
             
             # Delete from storage
             try:
-                # Extract file path from URL
                 image_url = post['image_url']
                 if STORAGE_BUCKET in image_url:
-                    # Parse the storage path
                     path_start = image_url.find(STORAGE_BUCKET) + len(STORAGE_BUCKET) + 1
                     storage_path = image_url[path_start:].split('?')[0]
                     supabase.storage.from_(STORAGE_BUCKET).remove([storage_path])
-                    print(f"  ✓ Deleted old post: {post['shortcode']}")
-            except Exception as e:
-                print(f"  ⚠️ Could not delete storage file for {post['shortcode']}: {e}")
+            except:
+                pass
         
-        print(f"✓ Cleanup complete! Kept {keep_count} latest posts")
+        print(f"✓ Kept {keep_count} latest posts")
         
     except Exception as e:
-        print(f"Error during cleanup: {e}")
+        print(f"❌ Cleanup error: {e}")
 
 def main():
     print("=" * 60)
-    print("Instagram Scraper Starting (SLOW MODE - No Rate Limits)")
-    print(f"Target account: @{INSTAGRAM_USERNAME}")
-    print(f"Database table: {TABLE_NAME}")
-    print("=" * 60)
-    print("\n⚠️ WARNING: This will take 10-20 minutes to complete!")
-    print("⚠️ Using very long delays to avoid Instagram rate limits")
+    print("Instagram Scraper - JSON Method (No Rate Limits)")
+    print(f"Target: @{INSTAGRAM_USERNAME}")
+    print(f"Method: Public JSON API")
     print("=" * 60)
     
-    # Download only new posts
-    posts = download_latest_posts(INSTAGRAM_USERNAME, limit=12)
+    # Fetch Instagram data
+    data = get_instagram_posts_json(INSTAGRAM_USERNAME)
+    
+    if not data:
+        print("\n❌ Failed to fetch Instagram data")
+        print("This could mean:")
+        print("  1. Account is private")
+        print("  2. Username is incorrect")
+        print("  3. Instagram changed their API")
+        return
+    
+    # Parse posts
+    posts = parse_instagram_data(data)
     
     if not posts:
-        print("\n✓ No new posts found or rate limited.")
-        print("If rate limited, wait 1-2 hours and try again.")
-        # Still run cleanup to ensure we only have 12 posts
-        delete_old_posts(keep_count=12)
+        print("\n❌ No posts found or parsing failed")
         return
     
     print(f"\n{'=' * 60}")
-    print(f"Processing {len(posts)} posts and uploading to Supabase...")
+    print(f"Processing {len(posts)} posts...")
     print('=' * 60)
     
-    new_posts_count = 0
-    updated_posts_count = 0
+    success_count = 0
+    updated_count = 0
     
     for idx, post in enumerate(posts, 1):
         shortcode = post['shortcode']
-        
-        print(f"\n[{idx}/{len(posts)}] Processing post: {shortcode}")
-        
-        # Check if exists
         exists = check_if_exists(shortcode)
         
-        # Find the media file
-        temp_folder = f"temp_{shortcode}"
-        media_file = find_media_file(temp_folder)
-        
-        if not media_file:
-            print(f"❌ No media file found for {shortcode}")
-            cleanup_temp_files(shortcode)
-            continue
+        print(f"\n[{idx}/{len(posts)}] Post: {shortcode}")
+        print(f"  Type: {'Video' if post['is_video'] else 'Image'}")
+        print(f"  Likes: {post['likes']}")
         
         # Determine file extension
         file_ext = '.mp4' if post['is_video'] else '.jpg'
+        local_file = f"temp_{shortcode}{file_ext}"
         remote_path = f"{INSTAGRAM_USERNAME}/{shortcode}{file_ext}"
         
-        if exists:
-            print(f"🔄 Post already exists, updating...")
-            # Upload media (in case it changed)
-            media_url = upload_to_supabase_storage(media_file, remote_path)
-            if media_url:
-                # Update existing post
-                try:
-                    supabase.table(TABLE_NAME).update({
-                        'likes': post['likes'],
-                        'caption': post['caption'],
-                        'scraped_at': datetime.utcnow().isoformat()
-                    }).eq('shortcode', shortcode).execute()
-                    print(f"✅ Updated {shortcode}")
-                    updated_posts_count += 1
-                except Exception as e:
-                    print(f"❌ Failed to update {shortcode}: {e}")
-        else:
-            # Upload new post
-            print(f"📤 Uploading new post: {shortcode} ({'video' if post['is_video'] else 'image'})...")
-            media_url = upload_to_supabase_storage(media_file, remote_path)
+        # Download media
+        print(f"  {'Updating' if exists else 'Downloading'}...")
+        if download_media(post['media_url'], local_file):
+            # Upload to Supabase
+            media_url = upload_to_supabase_storage(local_file, remote_path)
             
             if media_url:
                 # Save to database
-                result = save_to_database(post, media_url)
-                if result:
-                    print(f"✅ Added {shortcode}")
-                    new_posts_count += 1
+                if save_to_database(post, media_url):
+                    if exists:
+                        print(f"  ✅ Updated")
+                        updated_count += 1
+                    else:
+                        print(f"  ✅ Added")
+                        success_count += 1
                 else:
-                    print(f"❌ Failed to save {shortcode} to database")
+                    print(f"  ❌ Failed to save to database")
             else:
-                print(f"❌ Failed to upload {shortcode}")
+                print(f"  ❌ Failed to upload to Supabase")
+            
+            # Clean up local file
+            try:
+                os.remove(local_file)
+            except:
+                pass
+        else:
+            print(f"  ❌ Failed to download")
         
-        # Cleanup
-        cleanup_temp_files(shortcode)
+        # Small delay between posts
+        time.sleep(2)
     
-    # Clean up old posts (keep only latest 12)
+    # Clean up old posts
     delete_old_posts(keep_count=12)
     
     print("\n" + "=" * 60)
-    print(f"✓ Scraping Complete!")
-    print(f"New posts added: {new_posts_count}")
-    print(f"Existing posts updated: {updated_posts_count}")
-    print(f"Total in database: 12 (latest 12)")
+    print("✓ Scraping Complete!")
+    print(f"New posts added: {success_count}")
+    print(f"Existing posts updated: {updated_count}")
+    print(f"Total processed: {len(posts)}")
     print("=" * 60)
 
 if __name__ == "__main__":
