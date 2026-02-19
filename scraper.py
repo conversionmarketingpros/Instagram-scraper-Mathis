@@ -10,19 +10,21 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Initialize Instaloader
+# Initialize Instaloader with conservative settings
 L = instaloader.Instaloader(
     download_pictures=True,
     download_videos=True,
     download_video_thumbnails=False,
     compress_json=False,
     save_metadata=False,
-    post_metadata_txt_pattern=""
+    post_metadata_txt_pattern="",
+    max_connection_attempts=3,
+    request_timeout=300
 )
 
-# ⚠️ CONFIGURATION - CHANGE THESE FOR EACH CLIENT
-INSTAGRAM_USERNAME = "realestateduo.pnw"  # ← Change this!
-TABLE_NAME = "instagram_posts_newclient"    # ← Change this if using same Supabase!
+# ⚠️ CONFIGURATION - CHANGE THIS FOR YOUR NEW CLIENT
+INSTAGRAM_USERNAME = "realestateduo.pnw"  # ← CHANGE THIS!
+TABLE_NAME = "instagram_posts"
 STORAGE_BUCKET = "instagram-images"
 
 def get_latest_post_from_db():
@@ -42,8 +44,9 @@ def get_latest_post_from_db():
         return None
 
 def download_latest_posts(username, limit=12):
-    """Download only the latest posts from Instagram"""
+    """Download only the latest posts from Instagram with LONG delays"""
     print(f"Fetching latest posts from @{username}...")
+    print("⚠️ Using SLOW mode with long delays to avoid rate limits")
     
     latest_db_date = get_latest_post_from_db()
     if latest_db_date:
@@ -52,9 +55,16 @@ def download_latest_posts(username, limit=12):
         print("No posts in database yet, fetching recent posts...")
     
     try:
+        # LONG initial delay before starting
+        print("⏳ Waiting 10 seconds before fetching profile...")
+        time.sleep(10)
+        
         profile = instaloader.Profile.from_username(L.context, username)
         posts = []
         
+        print(f"✓ Profile loaded. Starting to fetch posts slowly...")
+        
+        post_count = 0
         for post in profile.get_posts():
             # If we already have this post or older, stop
             if latest_db_date and post.date_utc <= latest_db_date:
@@ -77,19 +87,46 @@ def download_latest_posts(username, limit=12):
             }
             
             posts.append(post_data)
+            post_count += 1
             
             # Download the media (image or video)
-            print(f"Downloading {'video' if post.is_video else 'image'}: {post.shortcode}")
-            L.download_post(post, target=f"temp_{post.shortcode}")
+            print(f"\n[{post_count}/{limit}] Downloading {'video' if post.is_video else 'image'}: {post.shortcode}")
             
-            # Be nice to Instagram - small delay
-            time.sleep(2)
+            # LONG delay before downloading (15 seconds)
+            print("⏳ Waiting 15 seconds before download...")
+            time.sleep(15)
+            
+            try:
+                L.download_post(post, target=f"temp_{post.shortcode}")
+                print(f"✓ Downloaded successfully")
+            except Exception as e:
+                print(f"⚠️ Error downloading {post.shortcode}: {e}")
+                # If download fails, wait even longer before continuing
+                print("⏳ Error occurred, waiting extra 20 seconds...")
+                time.sleep(20)
+                continue
+            
+            # EXTRA LONG delay every 2 posts (60 seconds!)
+            if post_count % 2 == 0:
+                print(f"⏳ Downloaded {post_count} posts. Taking a 60-second break to avoid rate limits...")
+                time.sleep(60)
+            else:
+                # Regular delay between posts (20 seconds)
+                print("⏳ Waiting 20 seconds before next post...")
+                time.sleep(20)
         
-        print(f"Found {len(posts)} new posts")
+        print(f"\n✓ Found {len(posts)} new posts")
         return posts
     
+    except instaloader.exceptions.ConnectionException as e:
+        print(f"❌ Connection error (possible rate limit): {e}")
+        print("💡 Try again in 1-2 hours. Instagram has temporarily blocked requests.")
+        return []
+    except instaloader.exceptions.QueryReturnedNotFoundException:
+        print(f"❌ User @{username} not found or account is private")
+        return []
     except Exception as e:
-        print(f"Error fetching posts: {e}")
+        print(f"❌ Error fetching posts: {e}")
         return []
 
 def upload_to_supabase_storage(local_path, remote_path):
@@ -217,27 +254,36 @@ def delete_old_posts(keep_count=12):
         print(f"Error during cleanup: {e}")
 
 def main():
-    print("=" * 50)
-    print("Instagram Scraper Starting...")
+    print("=" * 60)
+    print("Instagram Scraper Starting (SLOW MODE - No Rate Limits)")
     print(f"Target account: @{INSTAGRAM_USERNAME}")
     print(f"Database table: {TABLE_NAME}")
-    print("=" * 50)
+    print("=" * 60)
+    print("\n⚠️ WARNING: This will take 10-20 minutes to complete!")
+    print("⚠️ Using very long delays to avoid Instagram rate limits")
+    print("=" * 60)
     
     # Download only new posts
     posts = download_latest_posts(INSTAGRAM_USERNAME, limit=12)
     
     if not posts:
-        print("\n✓ No new posts found.")
+        print("\n✓ No new posts found or rate limited.")
+        print("If rate limited, wait 1-2 hours and try again.")
         # Still run cleanup to ensure we only have 12 posts
         delete_old_posts(keep_count=12)
         return
     
-    print(f"\nProcessing {len(posts)} posts...")
+    print(f"\n{'=' * 60}")
+    print(f"Processing {len(posts)} posts and uploading to Supabase...")
+    print('=' * 60)
+    
     new_posts_count = 0
     updated_posts_count = 0
     
-    for post in posts:
+    for idx, post in enumerate(posts, 1):
         shortcode = post['shortcode']
+        
+        print(f"\n[{idx}/{len(posts)}] Processing post: {shortcode}")
         
         # Check if exists
         exists = check_if_exists(shortcode)
@@ -256,7 +302,7 @@ def main():
         remote_path = f"{INSTAGRAM_USERNAME}/{shortcode}{file_ext}"
         
         if exists:
-            print(f"🔄 Post {shortcode} already exists, updating...")
+            print(f"🔄 Post already exists, updating...")
             # Upload media (in case it changed)
             media_url = upload_to_supabase_storage(media_file, remote_path)
             if media_url:
@@ -267,10 +313,10 @@ def main():
                         'caption': post['caption'],
                         'scraped_at': datetime.utcnow().isoformat()
                     }).eq('shortcode', shortcode).execute()
-                    print(f"  ✅ Updated {shortcode}")
+                    print(f"✅ Updated {shortcode}")
                     updated_posts_count += 1
                 except Exception as e:
-                    print(f"  ❌ Failed to update {shortcode}: {e}")
+                    print(f"❌ Failed to update {shortcode}: {e}")
         else:
             # Upload new post
             print(f"📤 Uploading new post: {shortcode} ({'video' if post['is_video'] else 'image'})...")
@@ -280,12 +326,12 @@ def main():
                 # Save to database
                 result = save_to_database(post, media_url)
                 if result:
-                    print(f"  ✅ Added {shortcode}")
+                    print(f"✅ Added {shortcode}")
                     new_posts_count += 1
                 else:
-                    print(f"  ❌ Failed to save {shortcode} to database")
+                    print(f"❌ Failed to save {shortcode} to database")
             else:
-                print(f"  ❌ Failed to upload {shortcode}")
+                print(f"❌ Failed to upload {shortcode}")
         
         # Cleanup
         cleanup_temp_files(shortcode)
@@ -293,12 +339,12 @@ def main():
     # Clean up old posts (keep only latest 12)
     delete_old_posts(keep_count=12)
     
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print(f"✓ Scraping Complete!")
     print(f"New posts added: {new_posts_count}")
     print(f"Existing posts updated: {updated_posts_count}")
     print(f"Total in database: 12 (latest 12)")
-    print("=" * 50)
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
