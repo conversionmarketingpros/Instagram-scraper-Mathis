@@ -1,6 +1,2 @@
-```
-instaloader==4.10.3
 supabase==2.3.0
 requests==2.31.0
-pillow==10.1.0
-```
