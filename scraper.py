@@ -300,5 +300,5 @@ def main():
     print(f"Total in database: 12 (latest 12)")
     print("=" * 50)
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
